@@ -266,6 +266,77 @@ def _rename_field_sql(cr, model, table, old_field, new_field):
 
 
 # ---------------------------------------------------------------------------
+# Table copy helper (used when official module owns the shared tables)
+# ---------------------------------------------------------------------------
+
+
+def _copy_table_with_data(cr, src_table, dst_table):
+    """Copy a table structure and all data, preserving IDs.
+
+    Used when the official ``account_loans`` module owns the original tables
+    and we cannot RENAME them.  Instead we CREATE the new OCA tables and
+    INSERT the data so both modules can coexist.
+    """
+    if not _table_exists(cr, src_table):
+        _logger.info("Source table %s does not exist, nothing to copy", src_table)
+        return False
+    if _table_exists(cr, dst_table):
+        _logger.warning(
+            "Destination table %s already exists, skipping copy from %s",
+            dst_table,
+            src_table,
+        )
+        return False
+
+    # Create new table with same structure and data
+    cr.execute(
+        'CREATE TABLE "%s" (LIKE "%s" INCLUDING DEFAULTS INCLUDING CONSTRAINTS)'
+        % (dst_table, src_table)
+    )
+    # Copy all rows keeping the same IDs
+    cr.execute(
+        'INSERT INTO "%s" SELECT * FROM "%s"' % (dst_table, src_table)
+    )
+    cr.execute('SELECT COUNT(*) FROM "%s"' % dst_table)
+    count = cr.fetchone()[0]
+
+    # Ensure we have a proper PK
+    cr.execute(
+        """
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = '%s'::regclass AND contype = 'p'
+    """
+        % dst_table
+    )
+    if not cr.fetchone():
+        cr.execute('ALTER TABLE "%s" ADD PRIMARY KEY (id)' % dst_table)
+
+    # Set up the id sequence so new records get correct IDs
+    seq_name = "%s_id_seq" % dst_table
+    cr.execute("SELECT 1 FROM pg_class WHERE relname = %s", (seq_name,))
+    if not cr.fetchone():
+        cr.execute(
+            'CREATE SEQUENCE "%s" OWNED BY "%s".id' % (seq_name, dst_table)
+        )
+    cr.execute(
+        "SELECT setval('%s', COALESCE((SELECT MAX(id) FROM \"%s\"), 1))"
+        % (seq_name, dst_table)
+    )
+    cr.execute(
+        "ALTER TABLE \"%s\" ALTER COLUMN id SET DEFAULT nextval('%s')"
+        % (dst_table, seq_name)
+    )
+
+    _logger.info(
+        "Copied %d records from %s → %s (preserving IDs)",
+        count,
+        src_table,
+        dst_table,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Conflict detection for official Odoo account_loans module
 # ---------------------------------------------------------------------------
 
@@ -286,6 +357,246 @@ def _official_module_owns_model(cr, model_name):
     )
     row = cr.fetchone()
     return row and row[0] == "account_loans"
+
+
+# ---------------------------------------------------------------------------
+# Conflict-aware migration (official account_loans present)
+# ---------------------------------------------------------------------------
+
+
+def _migrate_with_official_conflict(cr):
+    """Handle migration when the official ``account_loans`` module owns the
+    ``account.loan`` model.
+
+    Scenario (V14 → V18 → V19):
+    1. OCA ``account_loan`` was installed in V14 and created the data.
+    2. On upgrade to V18, the official ``account_loans`` (auto_install=True)
+       was automatically installed.  Since both modules define
+       ``_name = "account.loan"``, Odoo merged them into one shared
+       model / table.  The data is now "owned" by the official module.
+    3. For V19, OCA renames to ``account_loan_oca`` with models ``*.oca``.
+       We cannot RENAME the shared tables (the official module needs them),
+       so we COPY all data to the new OCA tables and set up the new FK
+       columns on ``account.move``.
+
+    After this function runs:
+    - ``account_loan_oca`` table has a full copy of ``account_loan`` data
+      (same IDs).
+    - ``account_loan_line_oca`` has a full copy of ``account_loan_line``.
+    - ``account_move.loan_oca_id`` / ``loan_line_oca_id`` are populated.
+    - The original tables are **untouched** for the official module.
+    - Orphaned ``ir_model_data`` entries for the OCA module are cleaned up.
+    """
+    _logger.info(
+        "Starting conflict-aware migration (official account_loans present)"
+    )
+
+    # ----------------------------------------------------------------
+    # 1. COPY persistent model tables
+    # ----------------------------------------------------------------
+    _copy_table_with_data(cr, "account_loan", "account_loan_oca")
+    _copy_table_with_data(cr, "account_loan_line", "account_loan_line_oca")
+
+    # Fix the loan_id FK inside account_loan_line_oca — it still points
+    # to account_loan.id which works because IDs are the same, but we
+    # should also ensure the column name stays "loan_id" (the V19 OCA
+    # model defines it as loan_id pointing to account.loan.oca).
+    # No column rename needed: the column is already called "loan_id"
+    # and the ORM will resolve it to the new comodel at runtime.
+
+    # ----------------------------------------------------------------
+    # 2. Handle account_move FK columns
+    #    Old fields: loan_id, loan_line_id (shared with official module)
+    #    New fields: loan_oca_id, loan_line_oca_id
+    #    We CREATE new columns and COPY values (don't touch originals).
+    # ----------------------------------------------------------------
+    if _column_exists(cr, "account_move", "loan_id"):
+        if not _column_exists(cr, "account_move", "loan_oca_id"):
+            cr.execute(
+                "ALTER TABLE account_move ADD COLUMN loan_oca_id INTEGER"
+            )
+        # Copy every loan_id that references a record we just copied
+        cr.execute(
+            """
+            UPDATE account_move am
+            SET loan_oca_id = am.loan_id
+            WHERE am.loan_id IS NOT NULL
+              AND am.loan_oca_id IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM account_loan_oca al
+                  WHERE al.id = am.loan_id
+              )
+        """
+        )
+        if cr.rowcount:
+            _logger.info(
+                "Copied %d loan_id values to loan_oca_id on account_move",
+                cr.rowcount,
+            )
+
+    if _column_exists(cr, "account_move", "loan_line_id"):
+        if not _column_exists(cr, "account_move", "loan_line_oca_id"):
+            cr.execute(
+                "ALTER TABLE account_move "
+                "ADD COLUMN loan_line_oca_id INTEGER"
+            )
+        cr.execute(
+            """
+            UPDATE account_move am
+            SET loan_line_oca_id = am.loan_line_id
+            WHERE am.loan_line_id IS NOT NULL
+              AND am.loan_line_oca_id IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM account_loan_line_oca all2
+                  WHERE all2.id = am.loan_line_id
+              )
+        """
+        )
+        if cr.rowcount:
+            _logger.info(
+                "Copied %d loan_line_id values to loan_line_oca_id "
+                "on account_move",
+                cr.rowcount,
+            )
+
+    # ----------------------------------------------------------------
+    # 3. UPDATE ir.sequence code (only OCA-owned sequence)
+    # ----------------------------------------------------------------
+    cr.execute(
+        """
+        UPDATE ir_sequence
+        SET code = 'account.loan.oca'
+        WHERE code = 'account.loan'
+          AND id IN (
+              SELECT res_id FROM ir_model_data
+              WHERE module = 'account_loan_oca'
+                AND model = 'ir.sequence'
+          )
+    """
+    )
+    if cr.rowcount:
+        _logger.info(
+            "Updated OCA ir.sequence code: account.loan → account.loan.oca"
+        )
+
+    # ----------------------------------------------------------------
+    # 4. Clean orphaned ir_model_data entries
+    #    hooks.py re-pointed module=account_loan → account_loan_oca,
+    #    but the auto-generated model/field entries now reference
+    #    ir_model / ir_model_fields records that belong to the
+    #    official module.  We must remove them so Odoo can create
+    #    fresh entries for the new OCA models.
+    # ----------------------------------------------------------------
+    # Auto-generated ir.model entries (model_account_loan, etc.)
+    cr.execute(
+        """
+        DELETE FROM ir_model_data
+        WHERE module = 'account_loan_oca'
+          AND model = 'ir.model'
+          AND name LIKE 'model_account_loan%%'
+          AND name NOT LIKE 'model_account_loan_oca%%'
+    """
+    )
+    if cr.rowcount:
+        _logger.info(
+            "Removed %d orphaned ir_model_data entries (ir.model) "
+            "that belong to official module",
+            cr.rowcount,
+        )
+
+    # Auto-generated ir.model.fields entries
+    cr.execute(
+        """
+        DELETE FROM ir_model_data
+        WHERE module = 'account_loan_oca'
+          AND model = 'ir.model.fields'
+          AND (
+              name LIKE 'field_account_loan__%%'
+              OR name LIKE 'field_account_loan_line__%%'
+              OR name LIKE 'field_account_loan_generate_wizard__%%'
+              OR name LIKE 'field_account_loan_pay_amount__%%'
+              OR name LIKE 'field_account_loan_post__%%'
+              OR name LIKE 'field_account_loan_increase_amount__%%'
+          )
+          AND name NOT LIKE '%%_oca%%'
+    """
+    )
+    if cr.rowcount:
+        _logger.info(
+            "Removed %d orphaned ir_model_data entries (ir.model.fields) "
+            "that belong to official module",
+            cr.rowcount,
+        )
+
+    # Auto-generated ir.model.access entries whose model_id FK points
+    # to the official module's ir_model records
+    cr.execute(
+        """
+        DELETE FROM ir_model_data
+        WHERE module = 'account_loan_oca'
+          AND model = 'ir.model.access'
+          AND name LIKE 'access_account_loan%%'
+          AND name NOT LIKE '%%_oca%%'
+    """
+    )
+    if cr.rowcount:
+        _logger.info(
+            "Removed %d orphaned ir_model_data entries (ir.model.access)",
+            cr.rowcount,
+        )
+
+    # ----------------------------------------------------------------
+    # 5. ir_property: update references to the OCA model
+    # ----------------------------------------------------------------
+    if _table_exists(cr, "ir_property"):
+        for old, new in [
+            ("account.loan,", "account.loan.oca,"),
+            ("account.loan.line,", "account.loan.line.oca,"),
+        ]:
+            cr.execute(
+                """
+                UPDATE ir_property
+                SET res_id = REPLACE(res_id, %s, %s)
+                WHERE res_id LIKE %s
+            """,
+                (old, new, old + "%"),
+            )
+            if _column_exists(cr, "ir_property", "value_reference"):
+                cr.execute(
+                    """
+                    UPDATE ir_property
+                    SET value_reference = REPLACE(value_reference, %s, %s)
+                    WHERE value_reference LIKE %s
+                """,
+                    (old, new, old + "%"),
+                )
+
+    # ----------------------------------------------------------------
+    # 6. Log warning about mail thread data
+    #    Mail messages / followers will be updated in post-migration
+    #    once the new model is registered in the ORM.
+    # ----------------------------------------------------------------
+    if _table_exists(cr, "mail_message"):
+        cr.execute(
+            """
+            SELECT COUNT(*) FROM mail_message
+            WHERE model IN ('account.loan', 'account.loan.line')
+        """
+        )
+        msg_count = cr.fetchone()[0]
+        if msg_count:
+            _logger.warning(
+                "Found %d mail.message records referencing the old "
+                "model names (account.loan / account.loan.line). "
+                "These will be updated to account.loan.oca / "
+                "account.loan.line.oca in the post-migration step.",
+                msg_count,
+            )
+
+    _logger.info(
+        "Conflict-aware pre-migration completed.  Data copied to "
+        "account_loan_oca / account_loan_line_oca tables."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -324,23 +635,11 @@ def migrate(cr, version):
         )
         if old_model_present and _official_module_owns_model(cr, "account.loan"):
             _logger.warning(
-                "The 'account.loan' model is owned by the official 'account_loans' "
-                "module. Skipping model/table renames to avoid conflicts. "
-                "The OCA module will create its own 'account.loan.oca' model."
+                "The 'account.loan' model is owned by the official "
+                "'account_loans' module.  Cannot RENAME tables — will "
+                "COPY data to new OCA tables instead."
             )
-            # Only update sequence code (OCA-specific)
-            cr.execute(
-                """
-                UPDATE ir_sequence
-                SET code = 'account.loan.oca'
-                WHERE code = 'account.loan'
-                  AND id IN (
-                      SELECT res_id FROM ir_model_data
-                      WHERE module = 'account_loan_oca'
-                        AND model = 'ir.sequence'
-                  )
-            """
-            )
+            _migrate_with_official_conflict(cr)
             return
 
     # --- Try to use odoo.upgrade.util if available ---

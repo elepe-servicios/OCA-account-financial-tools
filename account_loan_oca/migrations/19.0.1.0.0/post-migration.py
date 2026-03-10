@@ -37,6 +37,23 @@ def migrate(cr, version):
     _logger.info("Starting post-migration for account_loan_oca %s", version)
 
     # ================================================================
+    # 0. Detect if official account_loans module is installed
+    #    This affects how we handle mail_message / followers migration.
+    # ================================================================
+    cr.execute(
+        """
+        SELECT state FROM ir_module_module
+        WHERE name = 'account_loans' AND state IN ('installed', 'to upgrade')
+    """
+    )
+    has_official = bool(cr.fetchone())
+    if has_official:
+        _logger.info(
+            "Official 'account_loans' module is present — using "
+            "conflict-aware post-migration logic."
+        )
+
+    # ================================================================
     # 1. Clean up orphaned ir_model_data entries
     #    After renaming, there may be stale entries that point to
     #    models/tables that no longer exist under the old name.
@@ -89,20 +106,30 @@ def migrate(cr, version):
             )
 
     # ================================================================
-    # 3. Clean up any remaining model references to old model names
-    #    in mail_message, mail_followers, mail_activity, ir_attachment.
-    #    These might have been missed if odoo.upgrade.util was used
-    #    for model renames (util doesn't always cover these tables).
+    # 3. Update model references in mail / chatter tables
+    #    When the official module is present, both account.loan and
+    #    account.loan.oca tables exist (same data, same IDs).  We only
+    #    update records whose res_id has a match in the OCA table to
+    #    avoid moving references that the official module might own.
     # ================================================================
     old_to_new_models = [
-        ("account.loan", "account.loan.oca"),
-        ("account.loan.line", "account.loan.line.oca"),
+        ("account.loan", "account.loan.oca", "account_loan_oca"),
+        ("account.loan.line", "account.loan.line.oca", "account_loan_line_oca"),
     ]
-    for old_model, new_model in old_to_new_models:
+    for old_model, new_model, oca_table in old_to_new_models:
+        # Build an optional WHERE clause to limit scope when official
+        # module is present — only touch records whose res_id was copied.
+        oca_filter = ""
+        if has_official and _table_exists(cr, oca_table):
+            oca_filter = (
+                " AND res_id IN (SELECT id FROM \"%s\")" % oca_table
+            )
+
         # mail_message
         if _table_exists(cr, "mail_message"):
             cr.execute(
-                "UPDATE mail_message SET model = %s WHERE model = %s",
+                "UPDATE mail_message SET model = %%s "
+                "WHERE model = %%s%s" % oca_filter,
                 (new_model, old_model),
             )
             if cr.rowcount:
@@ -114,8 +141,10 @@ def migrate(cr, version):
                 )
         # mail_followers
         if _table_exists(cr, "mail_followers"):
+            follower_filter = oca_filter.replace("res_id", "res_id")
             cr.execute(
-                "UPDATE mail_followers SET res_model = %s WHERE res_model = %s",
+                "UPDATE mail_followers SET res_model = %%s "
+                "WHERE res_model = %%s%s" % follower_filter,
                 (new_model, old_model),
             )
             if cr.rowcount:
@@ -128,7 +157,8 @@ def migrate(cr, version):
         # mail_activity
         if _table_exists(cr, "mail_activity"):
             cr.execute(
-                "UPDATE mail_activity SET res_model = %s WHERE res_model = %s",
+                "UPDATE mail_activity SET res_model = %%s "
+                "WHERE res_model = %%s%s" % oca_filter,
                 (new_model, old_model),
             )
             if cr.rowcount:
@@ -141,7 +171,8 @@ def migrate(cr, version):
         # ir_attachment
         if _table_exists(cr, "ir_attachment"):
             cr.execute(
-                "UPDATE ir_attachment SET res_model = %s WHERE res_model = %s",
+                "UPDATE ir_attachment SET res_model = %%s "
+                "WHERE res_model = %%s%s" % oca_filter,
                 (new_model, old_model),
             )
             if cr.rowcount:

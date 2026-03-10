@@ -140,11 +140,78 @@ conflictos** si ambos módulos están instalados en la misma instancia.
 
 La migración maneja tres escenarios de conflicto:
 
-1. **El módulo oficial es dueño de `account.loan`**: Se omite el renombrado
-   de modelos/tablas y el módulo OCA crea sus propios modelos `.oca`.
+1. **El módulo oficial es dueño de `account.loan`**: Se **COPIAN** los datos
+   a las nuevas tablas OCA en vez de renombrar (ver sección siguiente).
 2. **El módulo oficial es dueño de `loan_id` en `account.move`**: Se
    **copia** el dato a `loan_oca_id` en lugar de renombrarlo.
 3. **Sin conflicto**: Se renombran modelos, tablas y campos normalmente.
+
+---
+
+## Escenario V14 → V18 → V19 (COPIA de datos)
+
+Este es el escenario más complejo:
+
+1. En **V14**, el módulo OCA `account_loan` estaba instalado y creó todos
+   los datos de préstamos (`account_loan`, `account_loan_line`, etc.).
+2. Al actualizar a **V18**, el módulo oficial `account_loans` se auto-instaló
+   (`auto_install: True`). Como ambos módulos definen `_name = "account.loan"`,
+   Odoo los combinó en un solo modelo/tabla. Los datos OCA ahora están en
+   tablas "propiedad" del módulo oficial.
+3. En **V19**, OCA renombra a `account_loan_oca` con modelos `*.oca`.
+   **No podemos RENOMBRAR** las tablas compartidas (el módulo oficial las
+   necesita), así que **COPIAMOS** todos los datos.
+
+### Qué hace la migración en este escenario
+
+#### Pre-migración (`pre-migration.py`)
+- Detecta que el módulo oficial es dueño de `account.loan` (consulta
+  `ir_model_data` buscando `module = 'account_loans'`).
+- Ejecuta `_migrate_with_official_conflict(cr)` en vez del renombrado
+  estándar:
+  1. **Copia tablas**: `account_loan` → `account_loan_oca`,
+     `account_loan_line` → `account_loan_line_oca` (usando
+     `CREATE TABLE ... LIKE ... INCLUDING DEFAULTS INCLUDING CONSTRAINTS`
+     + `INSERT INTO ... SELECT *`). Los IDs se preservan.
+  2. **Copia FKs en `account.move`**: Crea columnas `loan_oca_id` y
+     `loan_line_oca_id`, copia valores desde `loan_id` y `loan_line_id`.
+     Las columnas originales **no se tocan** (el módulo oficial las usa).
+  3. **Actualiza `ir.sequence`**: Solo la secuencia propiedad de OCA.
+  4. **Limpia `ir_model_data` huérfanos**: Borra entradas auto-generadas
+     (`model_account_loan`, `field_account_loan__*`, `access_account_loan*`)
+     que `hooks.py` re-apuntó a `account_loan_oca` pero que realmente
+     pertenecen al módulo oficial.
+  5. **Actualiza `ir_property`**: Referencias a los nuevos modelos OCA.
+  6. **Registra advertencia** sobre mensajes mail pendientes.
+
+#### Post-migración (`post-migration.py`)
+- Detecta la presencia del módulo oficial al inicio.
+- En **Sección 3** (mail/followers/actividades/adjuntos): solo actualiza
+  registros cuyo `res_id` exista en la tabla OCA correspondiente. Esto
+  evita mover mensajes de registros creados exclusivamente por el módulo
+  oficial.
+- El resto de secciones funciona igual que en el caso sin conflicto.
+
+### Resultado final
+
+| Tabla | Contenido | Dueño |
+|---|---|---|
+| `account_loan` | Datos originales (intactos) | Módulo oficial `account_loans` |
+| `account_loan_oca` | **Copia** de los datos | Módulo OCA `account_loan_oca` |
+| `account_loan_line` | Datos originales (intactos) | Módulo oficial |
+| `account_loan_line_oca` | **Copia** de los datos | Módulo OCA |
+
+| Campo en `account.move` | Apunta a | Dueño |
+|---|---|---|
+| `loan_id` | `account_loan` | Módulo oficial |
+| `loan_oca_id` | `account_loan_oca` | Módulo OCA |
+| `loan_line_id` | `account_loan_line` | Módulo oficial |
+| `loan_line_oca_id` | `account_loan_line_oca` | Módulo OCA |
+
+> **Nota sobre mensajes del chatter**: Los mensajes (`mail.message`),
+> seguidores (`mail.followers`) y actividades (`mail.activity`) se actualizan
+> en post-migración para referenciar el nuevo modelo OCA. Solo se afectan
+> los registros cuyo `res_id` existe en la tabla OCA.
 
 ---
 
