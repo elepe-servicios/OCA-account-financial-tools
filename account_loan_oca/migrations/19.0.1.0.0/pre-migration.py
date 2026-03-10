@@ -122,6 +122,30 @@ def _rename_model_sql(cr, old_model, new_model):
             "UPDATE ir_act_server SET model_name = %s WHERE model_name = %s",
             (new_model, old_model),
         )
+    # mail_message: update model references (chatter messages)
+    if _table_exists(cr, "mail_message"):
+        cr.execute(
+            "UPDATE mail_message SET model = %s WHERE model = %s",
+            (new_model, old_model),
+        )
+    # mail_followers: update res_model references
+    if _table_exists(cr, "mail_followers"):
+        cr.execute(
+            "UPDATE mail_followers SET res_model = %s WHERE res_model = %s",
+            (new_model, old_model),
+        )
+    # mail_activity: update res_model references
+    if _table_exists(cr, "mail_activity"):
+        cr.execute(
+            "UPDATE mail_activity SET res_model = %s WHERE res_model = %s",
+            (new_model, old_model),
+        )
+    # ir_attachment: update res_model references
+    if _table_exists(cr, "ir_attachment"):
+        cr.execute(
+            "UPDATE ir_attachment SET res_model = %s WHERE res_model = %s",
+            (new_model, old_model),
+        )
     _logger.info("Renamed model %s → %s (via SQL)", old_model, new_model)
 
 
@@ -161,6 +185,40 @@ def _rename_table_sql(cr, old_table, new_table):
         new_pk = "%s_pkey" % new_table
         if old_pk != new_pk:
             cr.execute('ALTER INDEX "%s" RENAME TO "%s"' % (old_pk, new_pk))
+
+    # Rename unique/check constraints that reference the old table name
+    cr.execute(
+        """
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '%s'::regclass
+          AND conname LIKE '%%' || '%s' || '%%'
+    """
+        % (new_table, old_table)
+    )
+    for (conname,) in cr.fetchall():
+        new_conname = conname.replace(old_table, new_table)
+        if conname != new_conname:
+            cr.execute(
+                'ALTER TABLE "%s" RENAME CONSTRAINT "%s" TO "%s"'
+                % (new_table, conname, new_conname)
+            )
+            _logger.info("Renamed constraint %s → %s", conname, new_conname)
+
+    # Rename indexes that reference the old table name
+    cr.execute(
+        """
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = %s AND indexname LIKE '%%' || %s || '%%'
+    """,
+        (new_table, old_table),
+    )
+    for (idxname,) in cr.fetchall():
+        new_idxname = idxname.replace(old_table, new_table)
+        if idxname != new_idxname:
+            cr.execute(
+                'ALTER INDEX "%s" RENAME TO "%s"' % (idxname, new_idxname)
+            )
+            _logger.info("Renamed index %s → %s", idxname, new_idxname)
 
     _logger.info("Renamed table %s → %s (via SQL)", old_table, new_table)
 
@@ -356,46 +414,176 @@ def migrate(cr, version):
             _rename_table_sql(cr, old_table, new_table)
 
     # ================================================================
-    # 2. RENAME FIELDS on inherited models
+    # 2. RENAME FIELDS on inherited models (preparation)
     #    Old: account.move.loan_id / account.move.loan_line_id
     #    New: account.move.loan_oca_id / account.move.loan_line_oca_id
+    #    The actual rename happens in section 3, which is
+    #    conflict-aware when the official account_loans module is present.
     # ================================================================
     field_renames = [
         ("account.move", "account_move", "loan_id", "loan_oca_id"),
         ("account.move", "account_move", "loan_line_id", "loan_line_oca_id"),
     ]
 
-    if _use_util:
-        for model, _table, old_field, new_field in field_renames:
-            if _column_exists(cr, _table, old_field):
-                try:
-                    util.rename_field(cr, model, old_field, new_field)
-                    _logger.info(
-                        "Renamed field %s.%s → %s (via util)",
-                        model,
-                        old_field,
-                        new_field,
-                    )
-                except Exception as e:
-                    _logger.warning(
-                        "util.rename_field(%s.%s) failed: %s. Falling back to SQL.",
-                        model,
-                        old_field,
-                        e,
-                    )
-                    _rename_field_sql(cr, model, _table, old_field, new_field)
-            else:
-                _logger.info(
-                    "Column %s.%s not found, skipping field rename",
-                    _table,
-                    old_field,
+    # ================================================================
+    # 3. RENAME FIELDS on account.move — conflict-aware
+    #    If the official account_loans module is installed AND also
+    #    defines loan_id on account.move, we must NOT rename loan_id
+    #    because the official module owns it. Instead we create a new
+    #    column loan_oca_id and copy the OCA data to it.
+    # ================================================================
+    if has_official and _column_exists(cr, "account_move", "loan_id"):
+        # Check if the official module also defines loan_id
+        cr.execute(
+            """
+            SELECT 1 FROM ir_model_fields
+            WHERE model = 'account.move'
+              AND name = 'loan_id'
+              AND id IN (
+                  SELECT res_id FROM ir_model_data
+                  WHERE module = 'account_loans'
+                    AND model = 'ir.model.fields'
+              )
+        """
+        )
+        official_owns_loan_id = bool(cr.fetchone())
+        if official_owns_loan_id:
+            _logger.warning(
+                "Official 'account_loans' module owns account.move.loan_id. "
+                "Will copy data to loan_oca_id instead of renaming."
+            )
+            # Create the new column if it doesn't exist
+            if not _column_exists(cr, "account_move", "loan_oca_id"):
+                cr.execute(
+                    "ALTER TABLE account_move ADD COLUMN loan_oca_id INTEGER"
                 )
+            # Copy data: only where loan_id references an OCA loan
+            # (i.e., record exists in account_loan_oca table)
+            new_loan_table = "account_loan_oca"
+            if not _table_exists(cr, new_loan_table):
+                new_loan_table = "account_loan"
+            cr.execute(
+                """
+                UPDATE account_move am
+                SET loan_oca_id = am.loan_id
+                WHERE am.loan_id IS NOT NULL
+                  AND am.loan_oca_id IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM "%s" al WHERE al.id = am.loan_id
+                  )
+            """
+                % new_loan_table
+            )
+            if cr.rowcount:
+                _logger.info(
+                    "Copied %d loan_id values to loan_oca_id on account.move",
+                    cr.rowcount,
+                )
+            # Similarly for loan_line_id → loan_line_oca_id
+            if _column_exists(cr, "account_move", "loan_line_id"):
+                if not _column_exists(cr, "account_move", "loan_line_oca_id"):
+                    cr.execute(
+                        "ALTER TABLE account_move ADD COLUMN loan_line_oca_id INTEGER"
+                    )
+                new_line_table = "account_loan_line_oca"
+                if not _table_exists(cr, new_line_table):
+                    new_line_table = "account_loan_line"
+                cr.execute(
+                    """
+                    UPDATE account_move am
+                    SET loan_line_oca_id = am.loan_line_id
+                    WHERE am.loan_line_id IS NOT NULL
+                      AND am.loan_line_oca_id IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM "%s" all2 WHERE all2.id = am.loan_line_id
+                      )
+                """
+                    % new_line_table
+                )
+                if cr.rowcount:
+                    _logger.info(
+                        "Copied %d loan_line_id values to loan_line_oca_id "
+                        "on account.move",
+                        cr.rowcount,
+                    )
+            # Update ir_model_fields for the new field names (create entries)
+            cr.execute(
+                """
+                UPDATE ir_model_fields
+                SET name = 'loan_oca_id'
+                WHERE model = 'account.move'
+                  AND name = 'loan_id'
+                  AND id IN (
+                      SELECT res_id FROM ir_model_data
+                      WHERE module = 'account_loan_oca'
+                        AND model = 'ir.model.fields'
+                  )
+            """
+            )
+            cr.execute(
+                """
+                UPDATE ir_model_fields
+                SET name = 'loan_line_oca_id'
+                WHERE model = 'account.move'
+                  AND name = 'loan_line_id'
+                  AND id IN (
+                      SELECT res_id FROM ir_model_data
+                      WHERE module = 'account_loan_oca'
+                        AND model = 'ir.model.fields'
+                  )
+            """
+            )
+        else:
+            # Official module doesn't own loan_id, safe to rename
+            for model, _table, old_field, new_field in field_renames:
+                if _use_util:
+                    if _column_exists(cr, _table, old_field):
+                        try:
+                            util.rename_field(cr, model, old_field, new_field)
+                        except Exception as e:
+                            _logger.warning(
+                                "util.rename_field(%s.%s) failed: %s",
+                                model,
+                                old_field,
+                                e,
+                            )
+                            _rename_field_sql(cr, model, _table, old_field, new_field)
+                else:
+                    _rename_field_sql(cr, model, _table, old_field, new_field)
     else:
-        for model, _table, old_field, new_field in field_renames:
-            _rename_field_sql(cr, model, _table, old_field, new_field)
+        # No official module conflict — standard field rename
+        if _use_util:
+            for model, _table, old_field, new_field in field_renames:
+                if _column_exists(cr, _table, old_field):
+                    try:
+                        util.rename_field(cr, model, old_field, new_field)
+                        _logger.info(
+                            "Renamed field %s.%s → %s (via util)",
+                            model,
+                            old_field,
+                            new_field,
+                        )
+                    except Exception as e:
+                        _logger.warning(
+                            "util.rename_field(%s.%s) failed: %s. "
+                            "Falling back to SQL.",
+                            model,
+                            old_field,
+                            e,
+                        )
+                        _rename_field_sql(cr, model, _table, old_field, new_field)
+                else:
+                    _logger.info(
+                        "Column %s.%s not found, skipping field rename",
+                        _table,
+                        old_field,
+                    )
+        else:
+            for model, _table, old_field, new_field in field_renames:
+                _rename_field_sql(cr, model, _table, old_field, new_field)
 
     # ================================================================
-    # 3. UPDATE ir.sequence CODE
+    # 4. UPDATE ir.sequence CODE
     #    Old: account.loan → New: account.loan.oca
     # ================================================================
     cr.execute(
@@ -412,7 +600,60 @@ def migrate(cr, version):
         )
 
     # ================================================================
-    # 4. UPDATE AUTO-GENERATED XML ID NAMES in ir_model_data
+    # 5. UPDATE ir_property references (if table exists)
+    #    Some Many2one fields may be stored as ir.property in older
+    #    versions. We need to update the res_id references.
+    # ================================================================
+    if _table_exists(cr, "ir_property"):
+        # Update res_id references like 'account.loan,123'
+        cr.execute(
+            """
+            UPDATE ir_property
+            SET res_id = REPLACE(res_id, 'account.loan,', 'account.loan.oca,')
+            WHERE res_id LIKE 'account.loan,%%'
+        """
+        )
+        if cr.rowcount:
+            _logger.info(
+                "Updated %d ir_property res_id references (account.loan → account.loan.oca)",
+                cr.rowcount,
+            )
+        cr.execute(
+            """
+            UPDATE ir_property
+            SET res_id = REPLACE(res_id, 'account.loan.line,', 'account.loan.line.oca,')
+            WHERE res_id LIKE 'account.loan.line,%%'
+        """
+        )
+        if cr.rowcount:
+            _logger.info(
+                "Updated %d ir_property res_id references "
+                "(account.loan.line → account.loan.line.oca)",
+                cr.rowcount,
+            )
+        # Update value_reference column
+        if _column_exists(cr, "ir_property", "value_reference"):
+            cr.execute(
+                """
+                UPDATE ir_property
+                SET value_reference = REPLACE(
+                    value_reference, 'account.loan,', 'account.loan.oca,'
+                )
+                WHERE value_reference LIKE 'account.loan,%%'
+            """
+            )
+            cr.execute(
+                """
+                UPDATE ir_property
+                SET value_reference = REPLACE(
+                    value_reference, 'account.loan.line,', 'account.loan.line.oca,'
+                )
+                WHERE value_reference LIKE 'account.loan.line,%%'
+            """
+            )
+
+    # ================================================================
+    # 6. UPDATE AUTO-GENERATED XML ID NAMES in ir_model_data
     #    The module prefix was already updated by pre_init_hook.
     #    Here we update the *name* part for auto-generated entries like
     #    model_account_loan → model_account_loan_oca
@@ -467,9 +708,36 @@ def migrate(cr, version):
     )
     if cr.rowcount:
         _logger.info(
-            "Updated %d XML ID names for ir.model.fields (account_loan_line → account_loan_line_oca)",
+            "Updated %d XML ID names for ir.model.fields "
+            "(account_loan_line → account_loan_line_oca)",
             cr.rowcount,
         )
+
+    # Update field XML IDs for wizard models
+    wizard_field_renames = [
+        ("field_account_loan_generate_wizard__", "field_account_loan_oca_generate_wizard__"),
+        ("field_account_loan_pay_amount__", "field_account_loan_oca_pay_amount__"),
+        ("field_account_loan_post__", "field_account_loan_oca_post__"),
+        ("field_account_loan_increase_amount__", "field_account_loan_oca_increase_amount__"),
+    ]
+    for old_prefix, new_prefix in wizard_field_renames:
+        cr.execute(
+            """
+            UPDATE ir_model_data
+            SET name = REPLACE(name, %s, %s)
+            WHERE name LIKE %s
+              AND module = 'account_loan_oca'
+              AND model = 'ir.model.fields'
+        """,
+            (old_prefix, new_prefix, old_prefix + "%"),
+        )
+        if cr.rowcount:
+            _logger.info(
+                "Updated %d XML ID names for wizard fields (%s → %s)",
+                cr.rowcount,
+                old_prefix,
+                new_prefix,
+            )
 
     # Update ir.model.access XML ID names
     cr.execute(
@@ -479,6 +747,43 @@ def migrate(cr, version):
         WHERE name LIKE 'access_account_loan_%%'
           AND module = 'account_loan_oca'
           AND model = 'ir.model.access'
+    """
+    )
+
+    # ================================================================
+    # 7. UPDATE ir.model.access: update the model_id FK to point to
+    #    the renamed model records
+    # ================================================================
+    cr.execute(
+        """
+        UPDATE ir_model_access ima
+        SET model_id = im.id
+        FROM ir_model im
+        WHERE im.model = 'account.loan.oca'
+          AND ima.model_id IN (
+              SELECT id FROM ir_model WHERE model = 'account.loan'
+          )
+          AND ima.id IN (
+              SELECT res_id FROM ir_model_data
+              WHERE module = 'account_loan_oca'
+                AND model = 'ir.model.access'
+          )
+    """
+    )
+    cr.execute(
+        """
+        UPDATE ir_model_access ima
+        SET model_id = im.id
+        FROM ir_model im
+        WHERE im.model = 'account.loan.line.oca'
+          AND ima.model_id IN (
+              SELECT id FROM ir_model WHERE model = 'account.loan.line'
+          )
+          AND ima.id IN (
+              SELECT res_id FROM ir_model_data
+              WHERE module = 'account_loan_oca'
+                AND model = 'ir.model.access'
+          )
     """
     )
 

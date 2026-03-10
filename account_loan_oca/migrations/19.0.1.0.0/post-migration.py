@@ -11,6 +11,28 @@ import logging
 _logger = logging.getLogger(__name__)
 
 
+def _table_exists(cr, table):
+    cr.execute(
+        """
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = %s AND table_schema = 'public'
+    """,
+        (table,),
+    )
+    return bool(cr.fetchone())
+
+
+def _column_exists(cr, table, column):
+    cr.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = %s AND column_name = %s AND table_schema = 'public'
+    """,
+        (table, column),
+    )
+    return bool(cr.fetchone())
+
+
 def migrate(cr, version):
     _logger.info("Starting post-migration for account_loan_oca %s", version)
 
@@ -49,15 +71,7 @@ def migrate(cr, version):
     #    If loan_oca_id is NULL but loan_line_oca_id has a value,
     #    derive the loan from the line (same logic as action_post).
     # ================================================================
-    cr.execute(
-        """
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'account_move'
-          AND column_name = 'loan_oca_id'
-          AND table_schema = 'public'
-    """
-    )
-    if cr.fetchone():
+    if _column_exists(cr, "account_move", "loan_oca_id"):
         cr.execute(
             """
             UPDATE account_move am
@@ -75,7 +89,71 @@ def migrate(cr, version):
             )
 
     # ================================================================
-    # 3. Clean up any remaining references to the old module name
+    # 3. Clean up any remaining model references to old model names
+    #    in mail_message, mail_followers, mail_activity, ir_attachment.
+    #    These might have been missed if odoo.upgrade.util was used
+    #    for model renames (util doesn't always cover these tables).
+    # ================================================================
+    old_to_new_models = [
+        ("account.loan", "account.loan.oca"),
+        ("account.loan.line", "account.loan.line.oca"),
+    ]
+    for old_model, new_model in old_to_new_models:
+        # mail_message
+        if _table_exists(cr, "mail_message"):
+            cr.execute(
+                "UPDATE mail_message SET model = %s WHERE model = %s",
+                (new_model, old_model),
+            )
+            if cr.rowcount:
+                _logger.info(
+                    "Updated %d mail_message records: %s → %s",
+                    cr.rowcount,
+                    old_model,
+                    new_model,
+                )
+        # mail_followers
+        if _table_exists(cr, "mail_followers"):
+            cr.execute(
+                "UPDATE mail_followers SET res_model = %s WHERE res_model = %s",
+                (new_model, old_model),
+            )
+            if cr.rowcount:
+                _logger.info(
+                    "Updated %d mail_followers records: %s → %s",
+                    cr.rowcount,
+                    old_model,
+                    new_model,
+                )
+        # mail_activity
+        if _table_exists(cr, "mail_activity"):
+            cr.execute(
+                "UPDATE mail_activity SET res_model = %s WHERE res_model = %s",
+                (new_model, old_model),
+            )
+            if cr.rowcount:
+                _logger.info(
+                    "Updated %d mail_activity records: %s → %s",
+                    cr.rowcount,
+                    old_model,
+                    new_model,
+                )
+        # ir_attachment
+        if _table_exists(cr, "ir_attachment"):
+            cr.execute(
+                "UPDATE ir_attachment SET res_model = %s WHERE res_model = %s",
+                (new_model, old_model),
+            )
+            if cr.rowcount:
+                _logger.info(
+                    "Updated %d ir_attachment records: %s → %s",
+                    cr.rowcount,
+                    old_model,
+                    new_model,
+                )
+
+    # ================================================================
+    # 4. Clean up any remaining references to the old module name
     #    in ir_model_data that slipped through.
     # ================================================================
     cr.execute(
@@ -92,7 +170,7 @@ def migrate(cr, version):
         )
 
     # ================================================================
-    # 4. Remove the old module from ir_module_module if it still exists
+    # 5. Remove the old module from ir_module_module if it still exists
     #    (safety net in case pre_init_hook didn't catch it)
     # ================================================================
     cr.execute(
@@ -106,5 +184,58 @@ def migrate(cr, version):
         _logger.info(
             "Removed old 'account_loan' entry from ir_module_module"
         )
+
+    # ================================================================
+    # 6. Update ir_module_module_dependency references
+    #    Any module that still has a dependency on 'account_loan'
+    #    should be updated to depend on 'account_loan_oca'.
+    # ================================================================
+    cr.execute(
+        """
+        UPDATE ir_module_module_dependency
+        SET name = 'account_loan_oca'
+        WHERE name = 'account_loan'
+    """
+    )
+    if cr.rowcount:
+        _logger.info(
+            "Updated %d dependency references from account_loan to account_loan_oca",
+            cr.rowcount,
+        )
+
+    # ================================================================
+    # 7. Verify data integrity — log warnings if anything looks wrong
+    # ================================================================
+    # Check that the new tables exist
+    for table in ("account_loan_oca", "account_loan_line_oca"):
+        if _table_exists(cr, table):
+            cr.execute("SELECT COUNT(*) FROM \"%s\"" % table)
+            count = cr.fetchone()[0]
+            _logger.info("Table %s has %d records", table, count)
+        else:
+            _logger.warning("Expected table %s does not exist!", table)
+
+    # Check for orphaned account.move records that reference
+    # non-existent loans (data integrity check)
+    if _column_exists(cr, "account_move", "loan_oca_id") and _table_exists(
+        cr, "account_loan_oca"
+    ):
+        cr.execute(
+            """
+            SELECT COUNT(*) FROM account_move am
+            WHERE am.loan_oca_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM account_loan_oca al
+                  WHERE al.id = am.loan_oca_id
+              )
+        """
+        )
+        orphan_count = cr.fetchone()[0]
+        if orphan_count:
+            _logger.warning(
+                "%d account.move records have loan_oca_id pointing to "
+                "non-existent loans. These may need manual cleanup.",
+                orphan_count,
+            )
 
     _logger.info("Post-migration for account_loan_oca completed successfully")

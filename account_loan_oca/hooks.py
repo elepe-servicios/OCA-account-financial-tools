@@ -18,16 +18,20 @@ def pre_init_hook(env):
 
     Also checks for the official Odoo ``account_loans`` module to
     avoid conflicts.
+
+    Handles migrations from any previous version (V14, V16, V18, etc.).
     """
     cr = env.cr
 
-    # Check if old module is installed
+    # Check if old module is installed (including 'to install' state
+    # which can happen if the module was previously uninstalled and
+    # is being installed again under the new name)
     cr.execute(
         """
         SELECT id, state, latest_version
         FROM ir_module_module
         WHERE name = %s
-          AND state IN ('installed', 'to upgrade')
+          AND state IN ('installed', 'to upgrade', 'to install')
     """,
         (OLD_MODULE,),
     )
@@ -41,11 +45,28 @@ def pre_init_hook(env):
         return
 
     old_id, old_state, old_version = old_module
+
+    # Skip if the old module is only 'uninstalled' (never actually installed)
+    if old_state == "uninstalled" and not old_version:
+        _logger.info(
+            "Old module '%s' has state='uninstalled' with no version. "
+            "Removing it to allow fresh install of '%s'.",
+            OLD_MODULE,
+            NEW_MODULE,
+        )
+        cr.execute(
+            "DELETE FROM ir_module_module_dependency WHERE module_id = %s",
+            (old_id,),
+        )
+        cr.execute("DELETE FROM ir_module_module WHERE id = %s", (old_id,))
+        return
+
     _logger.info(
-        "Found installed '%s' (id=%s, version=%s). "
+        "Found installed '%s' (id=%s, state=%s, version=%s). "
         "Migrating to '%s'...",
         OLD_MODULE,
         old_id,
+        old_state,
         old_version,
         NEW_MODULE,
     )
