@@ -7,7 +7,7 @@ from odoo import api, fields, models
 class ResPartner(models.Model):
     _inherit = "res.partner"
 
-    lended_loan_ids = fields.One2many("account.loan.oca", inverse_name="partner_id")
+    lended_loan_ids = fields.One2many("account.loan", inverse_name="partner_id")
     lended_loan_count = fields.Integer(
         compute="_compute_lended_loan_count",
         help="How many Loans this partner lended to us ?",
@@ -21,7 +21,7 @@ class ResPartner(models.Model):
     def action_view_partner_lended_loans(self):
         self.ensure_one()
         action = self.env["ir.actions.actions"]._for_xml_id(
-            "account_loan_oca.account_loan_action"
+            "account_loans.action_view_account_loans"
         )
         all_child = self.with_context(active_test=False).search(
             [("id", "child_of", self.ids)]

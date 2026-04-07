@@ -14,10 +14,13 @@ def pre_init_hook(env):
 
     If the old module account_loan is installed, we rename it to
     account_loan_oca so that Odoo treats this as an upgrade rather than
-    a fresh install. This ensures migration scripts run properly.
+    a fresh install.  This ensures migration scripts run properly.
 
-    Also checks for the official Odoo ``account_loans`` module to
-    avoid conflicts.
+    The new strategy (v19.0.2.0.0) uses ``_inherit = "account.loan"``
+    to extend the official ``account_loans`` module.  No model or table
+    renames are needed — only the module entry and ir_model_data.module
+    references are updated here.  Column-level data migration is handled
+    by ``migrations/19.0.2.0.0/pre-migration.py``.
 
     Handles migrations from any previous version (V14, V16, V18, etc.).
     """
@@ -71,7 +74,8 @@ def pre_init_hook(env):
         NEW_MODULE,
     )
 
-    # Warn if official Odoo 'account_loans' module is installed
+    # Log if official Odoo 'account_loans' module is installed
+    # (expected — it's a dependency via auto_install=True)
     cr.execute(
         """
         SELECT state FROM ir_module_module
@@ -79,9 +83,8 @@ def pre_init_hook(env):
     """
     )
     if cr.fetchone():
-        _logger.warning(
-            "Official Odoo 'account_loans' module is also installed. "
-            "Migration will proceed carefully to avoid conflicts."
+        _logger.info(
+            "Official Odoo 'account_loans' module is present (expected)."
         )
 
     # Check if the new module entry already exists

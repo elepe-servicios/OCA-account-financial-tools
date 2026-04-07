@@ -13,13 +13,13 @@ class AccountLoanPost(models.TransientModel):
     def _default_journal_id(self):
         loan_id = self.env.context.get("default_loan_id")
         if loan_id:
-            return self.env["account.loan.oca"].browse(loan_id).journal_id.id
+            return self.env["account.loan"].browse(loan_id).journal_id.id
 
     @api.model
     def _default_account_id(self):
         loan_id = self.env.context.get("default_loan_id")
         if loan_id:
-            loan = self.env["account.loan.oca"].browse(loan_id)
+            loan = self.env["account.loan"].browse(loan_id)
             if loan.is_leasing:
                 return loan.leased_asset_account_id.id
             else:
@@ -28,7 +28,7 @@ class AccountLoanPost(models.TransientModel):
                 ).property_account_receivable_id.id
 
     loan_id = fields.Many2one(
-        "account.loan.oca",
+        "account.loan",
         required=True,
         readonly=True,
     )
@@ -43,9 +43,7 @@ class AccountLoanPost(models.TransientModel):
         res = list()
         partner = self.loan_id.partner_id.with_company(self.loan_id.company_id)
         line = self.loan_id.line_ids.filtered(lambda r: r.sequence == 1)
-        # Amounts are evaled if > 0 for allowing negative loans to be able to be the
-        # donors of the loan
-        amount = line.pending_principal_amount
+        amount = line.oca_pending_principal_amount
         res.append(
             {
                 "account_id": self.account_id.id,
@@ -55,22 +53,22 @@ class AccountLoanPost(models.TransientModel):
                 "debit": amount if amount > 0 else 0,
             }
         )
-        diff_amount = abs(line.pending_principal_amount) - abs(
-            line.long_term_pending_principal_amount
+        diff_amount = abs(line.oca_pending_principal_amount) - abs(
+            line.oca_long_term_pending_principal_amount
         )
         if diff_amount > 0:
             res.append(
                 {
-                    "account_id": self.loan_id.short_term_loan_account_id.id,
+                    "account_id": self.loan_id.short_term_account_id.id,
                     "credit": diff_amount if amount > 0 else 0,
                     "debit": diff_amount if amount < 0 else 0,
                 }
             )
-        diff_amount = abs(line.long_term_pending_principal_amount)
-        if diff_amount > 0 and self.loan_id.long_term_loan_account_id:
+        diff_amount = abs(line.oca_long_term_pending_principal_amount)
+        if diff_amount > 0 and self.loan_id.long_term_account_id:
             res.append(
                 {
-                    "account_id": self.loan_id.long_term_loan_account_id.id,
+                    "account_id": self.loan_id.long_term_account_id.id,
                     "credit": diff_amount if amount > 0 else 0,
                     "debit": diff_amount if amount < 0 else 0,
                 }
@@ -79,8 +77,8 @@ class AccountLoanPost(models.TransientModel):
 
     def move_vals(self):
         return {
-            "loan_id": self.loan_id.id,
-            "date": self.loan_id.start_date,
+            "generating_loan_line_id": self.loan_id.line_ids[:1].id if self.loan_id.line_ids else False,
+            "date": self.loan_id.date,
             "ref": self.loan_id.name,
             "journal_id": self.journal_id.id,
             "line_ids": [Command.create(vals) for vals in self.move_line_vals()],
@@ -89,10 +87,10 @@ class AccountLoanPost(models.TransientModel):
     def run(self):
         self.ensure_one()
         if self.loan_id.line_ids:
-            total_principal = sum(self.loan_id.line_ids.mapped("principal_amount"))
+            total_principal = sum(self.loan_id.line_ids.mapped("principal"))
             if (
                 float_compare(
-                    self.loan_id.loan_amount, total_principal, precision_digits=2
+                    self.loan_id.amount_borrowed, total_principal, precision_digits=2
                 )
                 != 0
             ):
@@ -103,6 +101,6 @@ class AccountLoanPost(models.TransientModel):
                 )
         if self.loan_id.state != "draft":
             raise UserError(self.env._("Only loans in draft state can be posted"))
-        self.loan_id.post()
+        self.loan_id.oca_post()
         move = self.env["account.move"].create(self.move_vals())
         move.action_post()

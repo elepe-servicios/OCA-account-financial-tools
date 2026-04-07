@@ -5,12 +5,12 @@ from odoo import api, fields, models
 from odoo.exceptions import UserError
 
 
-class AccountLoan(models.TransientModel):
+class AccountLoanPayAmount(models.TransientModel):
     _name = "account.loan.oca.pay.amount"
     _description = "Loan pay amount"
 
     loan_id = fields.Many2one(
-        "account.loan.oca",
+        "account.loan",
         required=True,
         readonly=True,
     )
@@ -31,8 +31,8 @@ class AccountLoan(models.TransientModel):
     def _onchange_cancel_loan(self):
         if self.cancel_loan:
             self.amount = max(
-                self.loan_id.line_ids.filtered(lambda r: not r.move_ids).mapped(
-                    "pending_principal_amount"
+                self.loan_id.line_ids.filtered(lambda r: not r.generated_move_ids).mapped(
+                    "oca_pending_principal_amount"
                 )
             )
 
@@ -40,9 +40,9 @@ class AccountLoan(models.TransientModel):
         return {
             "loan_id": self.loan_id.id,
             "sequence": sequence,
-            "payment_amount": self.amount + self.fees,
-            "rate": 0,
-            "interests_amount": self.fees,
+            "principal": self.amount,
+            "interest": self.fees,
+            "oca_rate": 0,
             "date": self.date,
         }
 
@@ -50,20 +50,20 @@ class AccountLoan(models.TransientModel):
         self.ensure_one()
         if self.loan_id.is_leasing:
             if self.loan_id.line_ids.filtered(
-                lambda r: r.date <= self.date and not r.move_ids
+                lambda r: r.date <= self.date and not r.generated_move_ids
             ):
                 raise UserError(self.env._("Some invoices are not created"))
             if self.loan_id.line_ids.filtered(
-                lambda r: r.date > self.date and r.move_ids
+                lambda r: r.date > self.date and r.generated_move_ids
             ):
                 raise UserError(self.env._("Some future invoices already exists"))
         else:
             if self.loan_id.line_ids.filtered(
-                lambda r: r.date < self.date and not r.move_ids
+                lambda r: r.date < self.date and not r.generated_move_ids
             ):
                 raise UserError(self.env._("Some moves are not created"))
             if self.loan_id.line_ids.filtered(
-                lambda r: r.date > self.date and r.move_ids
+                lambda r: r.date > self.date and r.generated_move_ids
             ):
                 raise UserError(self.env._("Some future moves already exists"))
         lines = self.loan_id.line_ids.filtered(lambda r: r.date > self.date).sorted(
@@ -74,30 +74,30 @@ class AccountLoan(models.TransientModel):
             line.sequence += 1
             line.flush_recordset()
         old_line = lines.filtered(lambda r: r.sequence == sequence + 1)
-        pending = old_line.pending_principal_amount
+        pending = old_line.oca_pending_principal_amount
         if self.loan_id.currency_id.compare_amounts(self.amount, pending) == 1:
             raise UserError(self.env._("Amount cannot be bigger than debt"))
         if self.loan_id.currency_id.compare_amounts(self.amount, 0) <= 0:
             raise UserError(self.env._("Amount cannot be less than zero"))
-        self.loan_id.periods += 1
-        self.loan_id.fixed_periods = self.loan_id.periods - sequence
+        self.loan_id.duration += 1
+        self.loan_id.fixed_periods = self.loan_id.duration - sequence
         self.loan_id.fixed_loan_amount = pending - self.amount
-        new_line = self.env["account.loan.line.oca"].create(self.new_line_vals(sequence))
-        new_line.long_term_pending_principal_amount = (
-            old_line.long_term_pending_principal_amount
+        new_line = self.env["account.loan.line"].create(self.new_line_vals(sequence))
+        new_line.oca_long_term_pending_principal_amount = (
+            old_line.oca_long_term_pending_principal_amount
         )
-        amount = self.loan_id.loan_amount
+        amount = self.loan_id.amount_borrowed
         for line in self.loan_id.line_ids.sorted("sequence"):
-            if line.move_ids:
-                amount = line.final_pending_principal_amount
+            if line.generated_move_ids:
+                amount = line.oca_final_pending_principal_amount
             else:
-                line.pending_principal_amount = amount
+                line.oca_pending_principal_amount = amount
                 if line.sequence != sequence:
-                    line.rate = self.loan_id.rate_period
-                    line._check_amount()
-                amount -= line.payment_amount - line.interests_amount
-        if self.loan_id.long_term_loan_account_id:
-            self.loan_id._check_long_term_principal_amount()
+                    line.oca_rate = self.loan_id.rate_period
+                    line._oca_check_amount()
+                amount -= line.principal
+        if self.loan_id.long_term_account_id:
+            self.loan_id._oca_check_long_term_principal_amount()
         if self.loan_id.currency_id.compare_amounts(pending, self.amount) == 0:
             self.loan_id.write({"state": "cancelled"})
-        return new_line.view_process_values()
+        return new_line.oca_view_process_values()
