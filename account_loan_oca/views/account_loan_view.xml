@@ -115,7 +115,7 @@
                 </group>
             </notebook>
             <!-- Add Leasing page to notebook -->
-            <page string="Loan Settings" name="main_page" position="after">
+            <page name="main_page" position="after">
                 <page
                     string="Leasing"
                     id="oca_leasing"

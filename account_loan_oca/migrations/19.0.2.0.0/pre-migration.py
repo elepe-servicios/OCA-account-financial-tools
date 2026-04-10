@@ -258,6 +258,75 @@ def _clean_ir_model_data(cr):
             cr.rowcount,
         )
 
+    # --- Orphaned menus from old account_loan module ---------------------
+    #     The old module defined menus (loan_menu, account_loan_menu,
+    #     account_loan_lines_menu) and actions (account_loan_action,
+    #     account_loan_lines_action) that are no longer present in the
+    #     current module's XML.  After the hooks.py rename they sit in
+    #     ir_model_data with module='account_loan_oca' but point to
+    #     records that no XML file will ever update → orphans.
+    _orphan_menu_xmlids = (
+        "loan_menu",
+        "account_loan_menu",
+        "account_loan_lines_menu",
+        "account_loan_generate_wizard_menu",
+    )
+    _orphan_action_xmlids = (
+        "account_loan_action",
+        "account_loan_lines_action",
+        "account_loan_generate_wizard_action",
+    )
+
+    # Delete actual ir.ui.menu records (and their ir_model_data entries)
+    for xmlid in _orphan_menu_xmlids:
+        cr.execute(
+            """
+            SELECT res_id FROM ir_model_data
+            WHERE module = 'account_loan_oca'
+              AND name = %s
+              AND model = 'ir.ui.menu'
+        """,
+            (xmlid,),
+        )
+        row = cr.fetchone()
+        if row:
+            cr.execute("DELETE FROM ir_ui_menu WHERE id = %s", (row[0],))
+            cr.execute(
+                """
+                DELETE FROM ir_model_data
+                WHERE module = 'account_loan_oca' AND name = %s
+            """,
+                (xmlid,),
+            )
+            _logger.info("Deleted orphaned menu 'account_loan_oca.%s'", xmlid)
+
+    # Delete actual ir.actions.act_window records (and their ir_model_data entries)
+    for xmlid in _orphan_action_xmlids:
+        cr.execute(
+            """
+            SELECT res_id FROM ir_model_data
+            WHERE module = 'account_loan_oca'
+              AND name = %s
+              AND model = 'ir.actions.act_window'
+        """,
+            (xmlid,),
+        )
+        row = cr.fetchone()
+        if row:
+            cr.execute(
+                "DELETE FROM ir_act_window WHERE id = %s", (row[0],)
+            )
+            cr.execute(
+                """
+                DELETE FROM ir_model_data
+                WHERE module = 'account_loan_oca' AND name = %s
+            """,
+                (xmlid,),
+            )
+            _logger.info(
+                "Deleted orphaned action 'account_loan_oca.%s'", xmlid
+            )
+
 
 # ---------------------------------------------------------------------------
 # Main entry point
