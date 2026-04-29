@@ -1,11 +1,20 @@
 # Copyright 2018 Creu Blanca
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 
-from odoo import models
+from odoo import fields, models
 
 
 class AccountMove(models.Model):
     _inherit = "account.move"
+
+    oca_loan_line_id = fields.Many2one(
+        comodel_name="account.loan.line",
+        string="OCA Loan Line",
+        readonly=True,
+        ondelete="restrict",
+        copy=False,
+        help="OCA loan line that generated this entry (migrated from V18).",
+    )
 
     def action_post(self):
         res = super().action_post()

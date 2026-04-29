@@ -163,20 +163,94 @@ def _migrate_loan_line_table(cr):
 
 
 # ---------------------------------------------------------------------------
-# Account-move FK migration
+# FK constraint helpers
+# ---------------------------------------------------------------------------
+
+
+def _drop_fk_constraints(cr, table, *columns):
+    """Drop all FK constraints on *columns* of *table*.
+
+    V18 OCA added ``ondelete='restrict'`` FK constraints to several tables.
+    After the V19 migration those columns become orphaned (the OCA V19 module
+    no longer defines them via ``_inherit``).  The lingering RESTRICT
+    constraints would block legitimate enterprise operations such as
+    ``account_loan._unlink_loan`` which calls ``line_ids.unlink()``.
+    """
+    if not _table_exists(cr, table):
+        return
+    for column in columns:
+        if not _column_exists(cr, table, column):
+            continue
+        cr.execute(
+            """
+            SELECT tc.constraint_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema    = kcu.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema    = 'public'
+              AND tc.table_name      = %s
+              AND kcu.column_name    = %s
+            """,
+            (table, column),
+        )
+        for (constraint_name,) in cr.fetchall():
+            cr.execute(
+                'ALTER TABLE "%s" DROP CONSTRAINT IF EXISTS "%s"'
+                % (table, constraint_name)
+            )
+            _logger.info(
+                "Dropped FK constraint %s on %s.%s "
+                "(orphaned V18 OCA field, no longer tracked in V19)",
+                constraint_name, table, column,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Account-move and related-table FK migration
 # ---------------------------------------------------------------------------
 
 
 def _migrate_account_move(cr):
-    """Copy V14 OCA FK columns to official field names on account_move.
+    """Copy V14/V18 OCA FK columns to the official V19 Enterprise field names.
 
-    V14 OCA:  ``loan_line_id``  (Many2one → account.loan.line)
-    Official: ``generating_loan_line_id`` (Many2one → account.loan.line)
-    The official ``loan_id`` is a related field (non-stored), so no column
-    copy is needed for it — it reads from ``generating_loan_line_id.loan_id``.
+    Tables and field mappings
+    ─────────────────────────
+    +------------------+------------------+-----------------------------+
+    | Table            | V18 OCA column   | V19 Enterprise column       |
+    +==================+==================+=============================+
+    | account_move     | loan_line_id     | generating_loan_line_id     |
+    +------------------+------------------+-----------------------------+
+
+    The old ``loan_line_id`` is then *renamed* to ``oca_loan_line_id`` so that
+    migrated moves keep a backup reference to the originating loan line.
+    The OCA V19 model defines ``oca_loan_line_id`` as a stored Many2one;
+    Odoo's ORM will reuse the renamed column on the next module load.
+
+    The ``loan_id`` field on ``account_move`` is now a *related* (non-stored)
+    field in Enterprise V19 — it is computed via
+    ``generating_loan_line_id.loan_id``, so no column copy is needed.
+
+    Orphaned columns on ``account_payment``
+    ────────────────────────────────────────
+    V18 OCA also added ``loan_line_id`` (restrict) and ``loan_id`` (restrict)
+    to ``account_payment``.  Enterprise V19 ``account_loans`` does NOT extend
+    ``account_payment``, so those columns are fully orphaned.  Their RESTRICT
+    FK constraints must be removed to avoid blocking enterprise operations such
+    as ``account_loan._unlink_loan`` (which calls ``line_ids.unlink()``).
     """
     _logger.info("Migrating account_move FK columns")
+    # 1. Copy old value into the Enterprise field.
     _copy_column(cr, "account_move", "loan_line_id", "generating_loan_line_id")
+    # 2. Rename loan_line_id → oca_loan_line_id to preserve it as a backup
+    #    reference.  The OCA V19 model defines oca_loan_line_id; Odoo's ORM
+    #    will pick up the renamed column on the next module load.
+    _rename_column(cr, "account_move", "loan_line_id", "oca_loan_line_id")
+
+    # Drop orphaned RESTRICT FK constraints on account_payment so Enterprise
+    # can freely unlink loan lines without hitting Postgres FK violations.
+    _drop_fk_constraints(cr, "account_payment", "loan_line_id", "loan_id")
 
 
 # ---------------------------------------------------------------------------

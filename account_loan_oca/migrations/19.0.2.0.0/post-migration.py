@@ -89,33 +89,39 @@ def migrate(cr, version):
     # 4. Verify data integrity
     # ================================================================
 
-    # 4a. Check that generating_loan_line_id is populated for loan moves
-    if _column_exists(cr, "account_move", "generating_loan_line_id"):
-        # Count moves that have old loan_line_id but no generating_loan_line_id
-        if _column_exists(cr, "account_move", "loan_line_id"):
+    # 4a. Check that generating_loan_line_id is populated for loan moves.
+    #     After pre-migration, loan_line_id was renamed to oca_loan_line_id, so
+    #     we use oca_loan_line_id as the source for the safety-net re-copy.
+    if (
+        _table_exists(cr, "account_move")
+        and _column_exists(cr, "account_move", "generating_loan_line_id")
+        and _column_exists(cr, "account_move", "oca_loan_line_id")
+    ):
+        cr.execute(
+            """
+            SELECT COUNT(*) FROM account_move
+            WHERE oca_loan_line_id IS NOT NULL
+              AND generating_loan_line_id IS NULL
+            """
+        )
+        orphan_count = cr.fetchone()[0]
+        if orphan_count:
+            _logger.warning(
+                "%d account_move records have oca_loan_line_id but no "
+                "generating_loan_line_id. Re-copying...",
+                orphan_count,
+            )
             cr.execute(
                 """
-                SELECT COUNT(*) FROM account_move
-                WHERE loan_line_id IS NOT NULL
+                UPDATE account_move
+                SET generating_loan_line_id = oca_loan_line_id
+                WHERE oca_loan_line_id IS NOT NULL
                   AND generating_loan_line_id IS NULL
-            """
-            )
-            orphan_count = cr.fetchone()[0]
-            if orphan_count:
-                _logger.warning(
-                    "%d account.move records have loan_line_id but no "
-                    "generating_loan_line_id. Re-copying...",
-                    orphan_count,
-                )
-                cr.execute(
-                    """
-                    UPDATE account_move
-                    SET generating_loan_line_id = loan_line_id
-                    WHERE loan_line_id IS NOT NULL
-                      AND generating_loan_line_id IS NULL
                 """
-                )
-                _logger.info("Copied %d remaining FK values", cr.rowcount)
+            )
+            _logger.info(
+                "Copied %d remaining FK values for account_move", cr.rowcount
+            )
 
     # 4b. Count loan records (informational)
     if _table_exists(cr, "account_loan"):
@@ -135,6 +141,7 @@ def migrate(cr, version):
         ("account_loan", "loan_type"),
         ("account_loan_line", "oca_rate"),
         ("account_loan_line", "oca_pending_principal_amount"),
+        ("account_move", "oca_loan_line_id"),
     ]
     for table, col in oca_columns:
         if _table_exists(cr, table) and not _column_exists(cr, table, col):
