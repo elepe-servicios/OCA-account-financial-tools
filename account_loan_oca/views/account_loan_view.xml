@@ -87,15 +87,27 @@
                     </div>
                 </button>
             </div>
+            <!-- ============================================================ -->
+            <!-- loan type before amount_borrowed                         -->
+            <!-- ============================================================ -->
+            <xpath expr="//field[@name='amount_borrowed']" position="before">
+                <field name="loan_type" />
+            </xpath>
+
+            <xpath expr="//field[@name='date']" position="before">
+                <field name="partner_id" />
+            </xpath>
+
+            <xpath expr="//field[@name='asset_group_id']" position="before">
+                <field name="method_period" />
+            </xpath>
+
             <!-- Add OCA fields in the loan settings page -->
             <group name="loan_settings_column1" position="before">
                 <group string="OCA Loan Settings" name="oca_settings_1">
-                    <field name="partner_id" />
-                    <field name="loan_type" />
                     <field name="rate_type" />
                     <field name="rate" />
                     <field name="rate_period" />
-                    <field name="method_period" />
                 </group>
                 <group string="OCA Options" name="oca_settings_2">
                     <field name="is_leasing" />

@@ -53,8 +53,13 @@ def _column_exists(cr, table, column):
     return bool(cr.fetchone())
 
 
-def _copy_column(cr, table, src, dst):
-    """Copy non-NULL values from *src* to *dst* where *dst* IS NULL.
+def _copy_column(cr, table, src, dst, also_copy_zero=False):
+    """Copy non-NULL values from *src* to *dst* where *dst* IS NULL (or 0).
+
+    When *also_copy_zero* is True the copy also fires when *dst* equals 0.
+    This is needed for Monetary and Integer fields: Odoo adds those columns
+    with ``DEFAULT 0`` in PostgreSQL, so freshly-added columns on existing
+    rows are 0, not NULL, and ``IS NULL`` would never match.
 
     Safe to call multiple times (idempotent).
     Returns the number of rows updated.
@@ -67,9 +72,13 @@ def _copy_column(cr, table, src, dst):
     if not _column_exists(cr, table, dst):
         _logger.debug("Column %s.%s not found, skipping copy target", table, dst)
         return 0
+    if also_copy_zero:
+        dst_cond = '("%(d)s" IS NULL OR "%(d)s" = 0)'
+    else:
+        dst_cond = '"%(d)s" IS NULL'
     cr.execute(
-        'UPDATE "%(t)s" SET "%(d)s" = "%(s)s" '
-        'WHERE "%(s)s" IS NOT NULL AND "%(d)s" IS NULL'
+        ('UPDATE "%(t)s" SET "%(d)s" = "%(s)s" '
+         'WHERE "%(s)s" IS NOT NULL AND ' + dst_cond)
         % {"t": table, "s": src, "d": dst}
     )
     if cr.rowcount:
@@ -109,17 +118,20 @@ def _migrate_loan_table(cr):
     """Copy V14 OCA column data into official V19 column names."""
     _logger.info("Migrating account_loan columns → official names")
 
-    # Columns where old OCA name differs from official name
+    # Columns where old OCA name differs from official name.
+    # also_copy_zero=True is required for Monetary and Integer fields:
+    # when account_loans adds those columns to an existing table PostgreSQL
+    # initialises them to 0 (not NULL), so "IS NULL" would never match.
     column_map = [
-        ("loan_amount", "amount_borrowed"),
-        ("start_date", "date"),
-        ("periods", "duration"),
-        ("short_term_loan_account_id", "short_term_account_id"),
-        ("long_term_loan_account_id", "long_term_account_id"),
-        ("interest_expenses_account_id", "expense_account_id"),
+        ("loan_amount",                "amount_borrowed",          True),
+        ("start_date",                 "date",                     False),
+        ("periods",                    "duration",                 True),
+        ("short_term_loan_account_id", "short_term_account_id",    False),
+        ("long_term_loan_account_id",  "long_term_account_id",     False),
+        ("interest_expenses_account_id", "expense_account_id",     False),
     ]
-    for src, dst in column_map:
-        _copy_column(cr, "account_loan", src, dst)
+    for src, dst, also_zero in column_map:
+        _copy_column(cr, "account_loan", src, dst, also_copy_zero=also_zero)
 
     # Map state values: OCA 'posted' → official 'running'
     if _column_exists(cr, "account_loan", "state"):
@@ -139,14 +151,15 @@ def _migrate_loan_line_table(cr):
     """Copy V14 OCA columns to official names and rename OCA-only columns."""
     _logger.info("Migrating account_loan_line columns")
 
-    # 1. Copy to official column names
+    # 1. Copy to official column names.
+    # also_copy_zero=True: Monetary fields are added with DEFAULT 0 by Odoo.
     column_map = [
         ("interests_amount", "interest"),
         ("principal_amount", "principal"),
-        ("payment_amount", "payment"),
+        ("payment_amount",   "payment"),
     ]
     for src, dst in column_map:
-        _copy_column(cr, "account_loan_line", src, dst)
+        _copy_column(cr, "account_loan_line", src, dst, also_copy_zero=True)
 
     # 2. Rename OCA-exclusive columns to oca_ prefix.
     #    These columns have no equivalent in the official module; the new
