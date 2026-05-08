@@ -22,6 +22,7 @@
     ],
     "installable": True,
     "pre_init_hook": "pre_init_hook",
+    "post_init_hook": "post_init_hook",
     "maintainers": ["etobella"],
     "external_dependencies": {
         "python": ["numpy>=1.15", "numpy-financial<=1.0.0"],

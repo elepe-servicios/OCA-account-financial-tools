@@ -1,9 +1,32 @@
 # Copyright 2024 Creu Blanca
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 
+import importlib.util
 import logging
+import os
 
 _logger = logging.getLogger(__name__)
+
+_MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations", "19.0.2.0.0")
+
+
+def _load_migration_script(name):
+    """Load a migration script (pre-migration.py / post-migration.py) by name.
+
+    Returns the loaded module so callers can invoke ``module.migrate(cr, version)``.
+    Using importlib avoids any issues with the '.' characters in the directory name.
+    """
+    path = os.path.join(_MIGRATIONS_DIR, f"{name}.py")
+    if not os.path.exists(path):
+        _logger.warning("Migration script not found: %s", path)
+        return None
+    spec = importlib.util.spec_from_file_location(
+        f"account_loan_oca_migration_{name.replace('-', '_')}", path
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 OLD_MODULE = "account_loan"
 NEW_MODULE = "account_loan_oca"
@@ -171,3 +194,53 @@ def pre_init_hook(env):
         OLD_MODULE,
         NEW_MODULE,
     )
+
+    # -----------------------------------------------------------------------
+    # Run pre-migration script directly.
+    #
+    # When Odoo processes account_loan_oca as a *fresh install* (state was
+    # 'to install' when the module graph was built), the engine sets
+    # pkg.state = 'to install' in memory.  migration.migrate_module() checks
+    # that in-memory state and returns immediately if it is not 'to upgrade'.
+    # The DB update above (state = 'to upgrade') is too late — pkg is already
+    # constructed.  Calling the script here guarantees it runs regardless.
+    # The script is idempotent (checks column/table existence), so running it
+    # twice (here + via migration framework on a genuine upgrade) is safe.
+    # -----------------------------------------------------------------------
+    _logger.info(
+        "Running pre-migration script directly from pre_init_hook "
+        "(module entered as 'to install', normal migration path skipped)"
+    )
+    pre_mig = _load_migration_script("pre-migration")
+    if pre_mig and hasattr(pre_mig, "migrate"):
+        pre_mig.migrate(cr, old_version)
+    else:
+        _logger.error(
+            "pre-migration script could not be loaded — data migration skipped!"
+        )
+
+
+def post_init_hook(env):
+    """Run post-migration script after module data is loaded.
+
+    Same timing problem applies to post-migration.py: the script is only
+    executed by the migration framework when pkg.state == 'to upgrade'.
+    When the module was loaded as 'to install' (rename scenario), this hook
+    guarantees the post-migration logic runs after all data files are loaded.
+
+    The script is idempotent, so running it twice on a genuine upgrade is safe.
+    """
+    cr = env.cr
+
+    # Only execute if we are coming from a rename (old module existed).
+    # We detect this by checking whether the old module still exists in
+    # ir_model_data (it shouldn't, but the post-migration script handles that)
+    # or simply by always calling it — the script guards itself internally.
+    _logger.info(
+        "post_init_hook: running post-migration script for account_loan_oca"
+    )
+    post_mig = _load_migration_script("post-migration")
+    if post_mig and hasattr(post_mig, "migrate"):
+        post_mig.migrate(cr, None)
+    else:
+        _logger.warning("post-migration script could not be loaded in post_init_hook")
